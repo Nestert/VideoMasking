@@ -1,317 +1,336 @@
 import cv2
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox
 import numpy as np
 from PIL import Image, ImageTk
 import platform
+import json
+from datetime import timedelta
 
 class VideoAnnotationTool:
     def __init__(self, root):
         self.root = root
-        self.root.title("Video Annotation Tool")
+        self.root.title("Advanced Video Annotation Tool")
+        self.root.geometry("1200x800")
         
-        # Initialize variables
+        # Инициализация переменных
         self.video_path = None
         self.cap = None
+        self.total_frames = 0
         self.current_frame = None
-        self.masks = []  # List to store multiple masks
-        self.undo_stacks = []  # List of undo stacks corresponding to each mask
-        self.current_mask_index = -1  # Index to track the current mask
+        self.masks = []
+        self.undo_stacks = []
+        self.redo_stacks = []
+        self.current_mask_index = -1
         self.drawing = False
-        self.drawing_started = False  # Flag to prevent multiple undo pushes
-        self.eraser_mode = False  # Initialize eraser mode
-        self.brush_size = 5  # Default brush size
-        self.zoom_level = 1.0  # Initialize zoom level
+        self.last_x = 0
+        self.last_y = 0
+        self.zoom_level = 1.0
+        self.pan_start = None
+        self.cached_frame = None
+        self.last_zoom = 1.0
+        self.tools = {
+            "brush": {"size": 5, "color": (255, 0, 0)},
+            "rectangle": {"color": (0, 255, 0)},
+            "eraser": {"size": 10}
+        }
+        self.current_tool = "brush"
         
-        # Create GUI elements
+        # Создание интерфейса
         self.create_widgets()
-        
-        # Bind arrow keys for panning
-        self.bind_arrow_keys()
+        self.setup_bindings()
+        self.setup_menus()
         
     def create_widgets(self):
-        # Upload button
-        self.upload_btn = tk.Button(self.root, text="Upload Video", command=self.upload_video)
-        self.upload_btn.pack(pady=10)
+        # Главный контейнер
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Frame for canvas and scrollbars
-        self.canvas_container = tk.Frame(self.root)
-        self.canvas_container.pack(fill=tk.BOTH, expand=True)
+        # Панель инструментов
+        tool_frame = ttk.Frame(main_frame)
+        tool_frame.pack(side=tk.TOP, fill=tk.X)
         
-        # Vertical scrollbar
-        self.v_scroll = tk.Scrollbar(self.canvas_container, orient=tk.VERTICAL)
-        self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tool_buttons = {}
+        for tool in ["brush", "rectangle", "eraser"]:
+            btn = ttk.Button(tool_frame, text=tool.capitalize(), 
+                           command=lambda t=tool: self.set_tool(t))
+            btn.pack(side=tk.LEFT, padx=2)
+            self.tool_buttons[tool] = btn
+            
+        ttk.Separator(tool_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=5, fill=tk.Y)
         
-        # Horizontal scrollbar
-        self.h_scroll = tk.Scrollbar(self.canvas_container, orient=tk.HORIZONTAL)
-        self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.brush_size = tk.IntVar(value=5)
+        ttk.Scale(tool_frame, from_=1, to=50, variable=self.brush_size,
+                 command=lambda v: self.update_brush_size()).pack(side=tk.LEFT, padx=5)
+        self.brush_label = ttk.Label(tool_frame, text="Size: 5")
+        self.brush_label.pack(side=tk.LEFT)
         
-        # Canvas for video display
-        self.canvas = tk.Canvas(self.canvas_container, width=800, height=600, bg='grey',
-                                xscrollcommand=self.h_scroll.set,
-                                yscrollcommand=self.v_scroll.set)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        # Основная область
+        canvas_frame = ttk.Frame(main_frame)
+        canvas_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Configure scrollbars
-        self.v_scroll.config(command=self.canvas.yview)
-        self.h_scroll.config(command=self.canvas.xview)
+        # Холст с прокруткой
+        self.canvas = tk.Canvas(canvas_frame, bg="gray", cursor="cross")
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # Control buttons
-        self.controls_frame = tk.Frame(self.root)
-        self.controls_frame.pack(pady=10, fill=tk.X)  # Ensure the control frame fills horizontally
+        # Панель масок
+        mask_panel = ttk.Frame(canvas_frame, width=200)
+        mask_panel.pack(side=tk.RIGHT, fill=tk.Y)
         
-        self.prev_btn = tk.Button(self.controls_frame, text="Previous Frame", command=self.prev_frame)
-        self.prev_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(mask_panel, text="New Mask", command=self.create_mask).pack(pady=5)
+        ttk.Button(mask_panel, text="Delete Mask", command=self.delete_mask).pack(pady=5)
         
-        self.next_btn = tk.Button(self.controls_frame, text="Next Frame", command=self.next_frame)
-        self.next_btn.pack(side=tk.LEFT, padx=5)
+        self.mask_list = tk.Listbox(mask_panel)
+        self.mask_list.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.mask_list.bind("<<ListboxSelect>>", self.select_mask)
         
-        self.new_mask_btn = tk.Button(self.controls_frame, text="New Mask", command=self.new_mask)
-        self.new_mask_btn.pack(side=tk.LEFT, padx=5)
+        # Временная шкала
+        self.timeline = ttk.Scale(main_frame, command=self.on_timeline_change)
+        self.timeline.pack(fill=tk.X, padx=10, pady=5)
         
-        self.save_btn = tk.Button(self.controls_frame, text="Save Mask", command=self.save_mask)
-        self.save_btn.pack(side=tk.LEFT, padx=5)
+        # Статус бар
+        self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         
-        self.clear_mask_btn = tk.Button(self.controls_frame, text="Clear Mask", command=self.clear_mask)
-        self.clear_mask_btn.pack(side=tk.LEFT, padx=5)
+    def setup_bindings(self):
+        self.canvas.bind("<Button-1>", self.start_action)
+        self.canvas.bind("<B1-Motion>", self.perform_action)
+        self.canvas.bind("<ButtonRelease-1>", self.end_action)
+        self.canvas.bind("<Motion>", self.update_cursor_position)
+        self.root.bind("<Control-z>", lambda e: self.undo())
+        self.root.bind("<Control-y>", lambda e: self.redo())
+        self.root.bind("<Control-s>", lambda e: self.save_project())
+        self.root.bind("<MouseWheel>", self.zoom_handler)
+        self.root.bind("<Control-MouseWheel>", self.zoom_handler)
         
-        self.undo_btn = tk.Button(self.controls_frame, text="Undo", command=self.undo)
-        self.undo_btn.pack(side=tk.LEFT, padx=5)
+    def setup_menus(self):
+        menu_bar = tk.Menu(self.root)
         
-        self.eraser_btn = tk.Button(self.controls_frame, text="Toggle Eraser", command=self.toggle_eraser)
-        self.eraser_btn.pack(side=tk.LEFT, padx=5)
+        file_menu = tk.Menu(menu_bar, tearoff=0)
+        file_menu.add_command(label="Open Video", command=self.open_video)
+        file_menu.add_command(label="Save Project", command=self.save_project)
+        file_menu.add_command(label="Export Masks", command=self.export_masks)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.quit)
         
-        # Brush size slider
-        self.brush_size_slider = tk.Scale(self.controls_frame, from_=1, to=20, orient=tk.HORIZONTAL, label="Brush Size")
-        self.brush_size_slider.set(self.brush_size)
-        self.brush_size_slider.pack(side=tk.LEFT, padx=5)
+        edit_menu = tk.Menu(menu_bar, tearoff=0)
+        edit_menu.add_command(label="Undo", command=self.undo, accelerator="Ctrl+Z")
+        edit_menu.add_command(label="Redo", command=self.redo, accelerator="Ctrl+Y")
         
-        # Zoom in and out buttons
-        self.zoom_in_btn = tk.Button(self.controls_frame, text="Zoom In", command=self.zoom_in)
-        self.zoom_in_btn.pack(side=tk.LEFT, padx=5)
+        menu_bar.add_cascade(label="File", menu=file_menu)
+        menu_bar.add_cascade(label="Edit", menu=edit_menu)
         
-        self.zoom_out_btn = tk.Button(self.controls_frame, text="Zoom Out", command=self.zoom_out)
-        self.zoom_out_btn.pack(side=tk.LEFT, padx=5)
+        self.root.config(menu=menu_bar)
         
-        # Bind mouse events
-        self.canvas.bind("<Button-1>", self.start_drawing)
-        self.canvas.bind("<B1-Motion>", self.draw)
-        self.canvas.bind("<ButtonRelease-1>", self.stop_drawing)
-        self.bind_mouse_wheel()
-    
-    def bind_mouse_wheel(self):
-        # Detect the operating system to bind mouse wheel correctly
-        os_name = platform.system()
-        if os_name == 'Windows' or os_name == 'Darwin':
-            self.canvas.bind("<MouseWheel>", self.on_mousewheel)
-        else:  # Linux or other
-            self.canvas.bind("<Button-4>", self.on_mousewheel)
-            self.canvas.bind("<Button-5>", self.on_mousewheel)
-    
-    def on_mousewheel(self, event):
-        # Detect if Shift key is held for panning
-        if event.state & 0x0001:
-            # Shift is held: perform panning
-            if platform.system() == 'Windows' or platform.system() == 'Darwin':
-                if event.delta > 0:
-                    self.canvas.xview_scroll(-1, "units")  # Scroll left
-                else:
-                    self.canvas.xview_scroll(1, "units")  # Scroll right
-            else:
-                if event.num == 4:
-                    self.canvas.xview_scroll(-1, "units")
-                elif event.num == 5:
-                    self.canvas.xview_scroll(1, "units")
-        else:
-            # No modifier: perform zooming
-            if platform.system() == 'Windows' or platform.system() == 'Darwin':
-                if event.delta > 0:
-                    self.zoom_in()
-                else:
-                    self.zoom_out()
-            else:
-                if event.num == 4:
-                    self.zoom_in()
-                elif event.num == 5:
-                    self.zoom_out()
-    
-    def bind_arrow_keys(self):
-        self.root.bind("<Left>", lambda event: self.canvas.xview_scroll(-1, "units"))
-        self.root.bind("<Right>", lambda event: self.canvas.xview_scroll(1, "units"))
-        self.root.bind("<Up>", lambda event: self.canvas.yview_scroll(-1, "units"))
-        self.root.bind("<Down>", lambda event: self.canvas.yview_scroll(1, "units"))
-    
-    def upload_video(self):
-        self.video_path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv")])
-        if self.video_path:
-            self.cap = cv2.VideoCapture(self.video_path)
-            if not self.cap.isOpened():
-                messagebox.showerror("Error", "Не удалось открыть видео файл.")
-                return
+    def open_video(self):
+        path = filedialog.askopenfilename(filetypes=[
+            ("Video Files", "*.mp4 *.avi *.mov *.mkv"),
+            ("All Files", "*.*")
+        ])
+        if path:
+            self.video_path = path
+            self.cap = cv2.VideoCapture(path)
+            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.timeline.config(to=self.total_frames)
             self.show_frame()
-    
+            self.update_status()
+            
     def show_frame(self):
-        if self.cap is not None:
-            ret, frame = self.cap.read()
-            if ret:
-                self.current_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Initialize the first mask if no masks exist
-                if not self.masks:
-                    new_mask = np.zeros(self.current_frame.shape[:2], dtype=np.uint8)
-                    self.masks.append(new_mask)
-                    self.undo_stacks.append([])  # Initialize undo stack for the new mask
-                    self.current_mask_index = 0
-                self.update_canvas()
-            else:
-                # Если достигнут конец видео, сбросить позицию на начало
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                self.show_frame()
-    
-    def clear_mask(self):
-        if self.current_mask_index != -1:
-            # Push current mask to undo stack before clearing
-            self.push_undo()
-            self.masks[self.current_mask_index].fill(0)  # Clear the current mask
-            self.update_canvas()
-    
-    def new_mask(self):
-        # Create a new mask and set it as the current mask
-        if self.current_frame is not None:
-            new_mask = np.zeros(self.current_frame.shape[:2], dtype=np.uint8)
-            self.masks.append(new_mask)
-            self.undo_stacks.append([])  # Initialize undo stack for the new mask
-            self.current_mask_index = len(self.masks) - 1
-            self.update_canvas()
-    
-    def push_undo(self):
-        if self.current_mask_index != -1:
-            # Make a copy of the current mask and push to the corresponding undo stack
-            mask_copy = self.masks[self.current_mask_index].copy()
-            self.undo_stacks[self.current_mask_index].append(mask_copy)
-            # Limit the undo stack size if necessary (optional)
-            if len(self.undo_stacks[self.current_mask_index]) > 20:
-                self.undo_stacks[self.current_mask_index].pop(0)
-    
-    def undo(self):
-        if self.current_mask_index != -1 and self.undo_stacks[self.current_mask_index]:
-            # Pop the last state from the undo stack and set it as the current mask
-            last_state = self.undo_stacks[self.current_mask_index].pop()
-            self.masks[self.current_mask_index] = last_state
-            self.update_canvas()
-        else:
-            messagebox.showinfo("Undo", "Нет доступных действий для отмены.")
-    
-    def draw(self, event):
-        if self.drawing and self.current_mask_index != -1:
-            # Adjust for zoom to get the correct position on the original image
-            x = int(self.canvas.canvasx(event.x) / self.zoom_level)
-            y = int(self.canvas.canvasy(event.y) / self.zoom_level)
-            brush_size = self.brush_size_slider.get()  # Get the current brush size from the slider
+        ret, frame = self.cap.read()
+        if ret:
+            self.current_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self.cached_frame = None
+            self.draw_overlays()
             
-            # Ensure coordinates are within image bounds
-            if 0 <= x < self.current_frame.shape[1] and 0 <= y < self.current_frame.shape[0]:
-                # Push the current mask state before modification
-                if not self.drawing_started:
-                    self.push_undo()
-                    self.drawing_started = True
-                
-                if self.eraser_mode:
-                    cv2.circle(self.masks[self.current_mask_index], (x, y), brush_size, 0, -1)  # Erase part of the mask
-                else:
-                    cv2.circle(self.masks[self.current_mask_index], (x, y), brush_size, 255, -1)  # Draw on the mask
-                self.update_canvas()
-    
-    def start_drawing(self, event):
+    def draw_overlays(self):
+        if self.current_frame is None:
+            return
+        
+        display_frame = self.current_frame.copy()
+        
+        # Рисование всех масок
+        for idx, mask in enumerate(self.masks):
+            color = (255, 0, 0) if idx == self.current_mask_index else (0, 0, 255)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(display_frame, contours, -1, color, 2)
+            
+        # Применение масштаба
+        h, w = display_frame.shape[:2]
+        zoomed_size = (int(w * self.zoom_level), int(h * self.zoom_level))
+        
+        if self.cached_frame is None or zoomed_size != self.cached_frame.size:
+            self.cached_frame = ImageTk.PhotoImage(
+                Image.fromarray(display_frame).resize(zoomed_size, Image.LANCZOS)
+            )
+            
+        self.canvas.config(
+            scrollregion=(0, 0, zoomed_size[0], zoomed_size[1]),
+            width=zoomed_size[0],
+            height=zoomed_size[1]
+        )
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self.cached_frame, anchor=tk.NW)
+        
+    def create_mask(self):
+        new_mask = np.zeros(self.current_frame.shape[:2], dtype=np.uint8)
+        self.masks.append(new_mask)
+        self.undo_stacks.append([])
+        self.redo_stacks.append([])
+        self.mask_list.insert(tk.END, f"Mask {len(self.masks)}")
+        self.current_mask_index = len(self.masks) - 1
+        self.mask_list.selection_clear(0, tk.END)
+        self.mask_list.selection_set(self.current_mask_index)
+        self.update_status()
+        
+    def delete_mask(self):
+        if self.current_mask_index >= 0:
+            del self.masks[self.current_mask_index]
+            del self.undo_stacks[self.current_mask_index]
+            del self.redo_stacks[self.current_mask_index]
+            self.mask_list.delete(self.current_mask_index)
+            self.current_mask_index = max(0, self.current_mask_index - 1)
+            self.draw_overlays()
+            
+    def select_mask(self, event):
+        selection = self.mask_list.curselection()
+        if selection:
+            self.current_mask_index = selection[0]
+            self.draw_overlays()
+            
+    def set_tool(self, tool):
+        self.current_tool = tool
+        for t, btn in self.tool_buttons.items():
+            btn.state(["!pressed" if t != tool else "pressed"])
+        self.update_cursor()
+        
+    def update_brush_size(self):
+        size = self.brush_size.get()
+        self.tools["brush"]["size"] = size
+        self.tools["eraser"]["size"] = size
+        self.brush_label.config(text=f"Size: {size}")
+        
+    def start_action(self, event):
         self.drawing = True
-        self.drawing_started = False  # Flag to ensure undo is pushed once per drawing action
-        self.draw(event)
-    
-    def stop_drawing(self, event):
+        x = self.canvas.canvasx(event.x) / self.zoom_level
+        y = self.canvas.canvasy(event.y) / self.zoom_level
+        self.last_x, self.last_y = x, y
+        
+        if self.current_mask_index >= 0:
+            self.push_undo()
+            
+    def perform_action(self, event):
+        if not self.drawing or self.current_mask_index < 0:
+            return
+            
+        x = self.canvas.canvasx(event.x) / self.zoom_level
+        y = self.canvas.canvasy(event.y) / self.zoom_level
+        
+        mask = self.masks[self.current_mask_index]
+        
+        if self.current_tool == "brush":
+            cv2.line(mask, 
+                    (int(self.last_x), int(self.last_y)),
+                    (int(x), int(y)),
+                    255, self.tools["brush"]["size"])
+            
+        elif self.current_tool == "eraser":
+            cv2.line(mask, 
+                    (int(self.last_x), int(self.last_y)),
+                    (int(x), int(y)),
+                    0, self.tools["eraser"]["size"])
+            
+        elif self.current_tool == "rectangle":
+            if not hasattr(self, 'rect_start'):
+                self.rect_start = (x, y)
+            self.temp_rect = (self.rect_start[0], self.rect_start[1], x, y)
+            self.draw_temp_overlay()
+            
+        self.last_x, self.last_y = x, y
+        self.draw_overlays()
+        
+    def end_action(self, event):
+        if self.current_tool == "rectangle" and hasattr(self, 'rect_start'):
+            x = self.canvas.canvasx(event.x) / self.zoom_level
+            y = self.canvas.canvasy(event.y) / self.zoom_level
+            x1, y1 = self.rect_start
+            x2, y2 = x, y
+            cv2.rectangle(self.masks[self.current_mask_index],
+                         (int(min(x1, x2)), int(min(y1, y2))),
+                         (int(max(x1, x2)), int(max(y1, y2))),
+                         255, -1)
+            del self.rect_start
+            self.canvas.delete("temp")
+            self.draw_overlays()
+            
         self.drawing = False
-        self.drawing_started = False  # Reset the flag
-    
-    def toggle_eraser(self):
-        self.eraser_mode = not self.eraser_mode  # Toggle eraser mode
-        if self.eraser_mode:
-            self.eraser_btn.config(relief=tk.SUNKEN, bg='red')
-        else:
-            self.eraser_btn.config(relief=tk.RAISED, bg='SystemButtonFace')
-    
-    def update_canvas(self):
-        if self.current_frame is not None:
-            # Overlay all masks on frame
-            display_frame = self.current_frame.copy()
-            for mask in self.masks:
-                # Create a red overlay where mask is present
-                red_overlay = np.zeros_like(display_frame, dtype=np.uint8)
-                red_overlay[:, :, 0] = 255  # Red channel
-                mask_bool = mask == 255
-                # Blend the red overlay with the original frame
-                display_frame[mask_bool] = cv2.addWeighted(display_frame, 0.5, red_overlay, 0.5, 0)[mask_bool]
+        
+    def push_undo(self):
+        if self.current_mask_index >= 0:
+            self.undo_stacks[self.current_mask_index].append(
+                self.masks[self.current_mask_index].copy()
+            )
+            self.redo_stacks[self.current_mask_index].clear()
             
-            # Apply zoom only to the image
-            height, width = display_frame.shape[:2]
-            zoomed_width = int(width * self.zoom_level)
-            zoomed_height = int(height * self.zoom_level)
-            zoomed_frame = cv2.resize(display_frame, (zoomed_width, zoomed_height), interpolation=cv2.INTER_LINEAR)
+    def undo(self):
+        if self.current_mask_index >= 0 and self.undo_stacks[self.current_mask_index]:
+            self.redo_stacks[self.current_mask_index].append(
+                self.masks[self.current_mask_index].copy()
+            )
+            self.masks[self.current_mask_index] = self.undo_stacks[self.current_mask_index].pop()
+            self.draw_overlays()
             
-            # Convert to PhotoImage
-            image = Image.fromarray(zoomed_frame)
-            photo = ImageTk.PhotoImage(image)
+    def redo(self):
+        if self.current_mask_index >= 0 and self.redo_stacks[self.current_mask_index]:
+            self.undo_stacks[self.current_mask_index].append(
+                self.masks[self.current_mask_index].copy()
+            )
+            self.masks[self.current_mask_index] = self.redo_stacks[self.current_mask_index].pop()
+            self.draw_overlays()
             
-            # Update canvas with zoomed image
-            self.canvas.delete("all")  # Clear previous image
-            self.canvas.create_image(0, 0, anchor=tk.NW, image=photo)
-            self.canvas.image = photo  # Keep a reference to prevent garbage collection
+    def zoom_handler(self, event):
+        if event.state & 0x4:  # Ctrl key
+            delta = event.delta if platform.system() == 'Darwin' else -event.delta
+            self.zoom_level *= 1.1 if delta > 0 else 0.9
+            self.zoom_level = max(0.1, min(5.0, self.zoom_level))
+            self.draw_overlays()
             
-            # Update scrollregion
-            self.canvas.config(scrollregion=(0, 0, zoomed_width, zoomed_height))
-    
-    def zoom_in(self):
-        self.zoom_level *= 1.2  # Increase zoom level
-        if self.zoom_level > 5.0:  # Maximum zoom level
-            self.zoom_level = 5.0
-        self.update_canvas()
-    
-    def zoom_out(self):
-        self.zoom_level /= 1.2  # Decrease zoom level
-        if self.zoom_level < 0.2:  # Minimum zoom level
-            self.zoom_level = 0.2
-        self.update_canvas()
-    
-    def save_mask(self):
-        if self.masks and self.cap is not None:
-            # Get the current frame number and time
-            frame_number = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            video_time = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000  # Convert milliseconds to seconds
+    def on_timeline_change(self, value):
+        frame_num = int(float(value))
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        self.show_frame()
+        self.update_status()
+        
+    def update_status(self):
+        if self.cap:
+            pos = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+            time_str = str(timedelta(seconds=pos)).split(".")[0]
+            frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+            status = f"Frame: {frame}/{self.total_frames} | Time: {time_str} | Tool: {self.current_tool}"
+            self.status_bar.config(text=status)
             
-            # Select directory to save masks
-            save_dir = filedialog.askdirectory(title="Выберите папку для сохранения масок")
-            if not save_dir:
-                return  # Если пользователь отменил выбор папки
+    def update_cursor_position(self, event):
+        x = self.canvas.canvasx(event.x) / self.zoom_level
+        y = self.canvas.canvasy(event.y) / self.zoom_level
+        self.status_bar.config(text=f"X: {int(x)}, Y: {int(y)}")
+        
+    def save_project(self):
+        project = {
+            "video_path": self.video_path,
+            "current_frame": int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)),
+            "masks": [mask.tolist() for mask in self.masks]
+        }
+        path = filedialog.asksaveasfilename(defaultextension=".json")
+        if path:
+            with open(path, "w") as f:
+                json.dump(project, f)
+                
+    def export_masks(self):
+        path = filedialog.askdirectory()
+        if path and self.masks:
+            for idx, mask in enumerate(self.masks):
+                cv2.imwrite(f"{path}/mask_{idx}.png", mask)
+            messagebox.showinfo("Export", f"Exported {len(self.masks)} masks")
             
-            # Save each mask with a unique filename
-            for i, mask in enumerate(self.masks):
-                filename = f"mask_{i}_time_{video_time:.2f}_frame_{frame_number}.png"
-                filepath = f"{save_dir}/{filename}"
-                cv2.imwrite(filepath, mask)
-            
-            messagebox.showinfo("Save Mask", f"Маски успешно сохранены в {save_dir}.")
-        else:
-            messagebox.showwarning("Save Mask", "Нет масок для сохранения или видео не загружено.")
-    
-    def next_frame(self):
-        if self.cap is not None:
-            self.show_frame()
-    
-    def prev_frame(self):
-        if self.cap is not None and self.video_path:
-            current_pos = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
-            # Move back two frames: one to go to the previous frame, another because read() moves forward
-            new_pos = max(0, current_pos - 2)
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, new_pos)
-            self.show_frame()
-
 if __name__ == "__main__":
     root = tk.Tk()
     app = VideoAnnotationTool(root)
